@@ -1,0 +1,167 @@
+<?php
+require __DIR__ . '/config.php';
+
+function finish(string $title, string $message): never {
+    echo '<!doctype html><html lang="en"><meta charset="utf-8"><title>' . htmlspecialchars($title) . '</title><body style="font:16px Arial;max-width:800px;margin:40px auto">';
+    echo '<h1>' . htmlspecialchars($title) . '</h1><p>' . htmlspecialchars($message) . '</p><p><a href="index.php">Store</a> | <a href="cart.php">Cart</a> | <a href="orders.php">Orders</a></p></body></html>';
+    exit;
+}
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') { header('Location: cart.php'); exit; }
+
+$customer = trim((string)($_POST['customer_name'] ?? ''));
+$method = (string)($_POST['payment_method'] ?? 'CARD');
+if ($customer === '') finish('Missing information', 'Enter a customer name.');
+if (!in_array($method, ['CARD','EWALLET','BANK'], true)) $method = 'CARD';
+
+$cart = $_SESSION['cart'] ?? [];
+if (!$cart) finish('Empty cart', 'Add an item before checkout.');
+
+$pdo = cart_db();
+$ids = array_map('intval', array_keys($cart));
+$marks = implode(',', array_fill(0, count($ids), '?'));
+$stmt = $pdo->prepare("SELECT id,name,price,stock FROM products WHERE id IN ($marks)");
+$stmt->execute($ids);
+$products = $stmt->fetchAll();
+$total = 0.0; $validItems = [];
+foreach ($products as $p) {
+    $qty = min((int)$cart[$p['id']], (int)$p['stock']);
+    if ($qty > 0) {
+        $total += $qty * (float)$p['price'];
+        $validItems[] = ['product'=>$p,'qty'=>$qty];
+    }
+}
+if (!$validItems || $total <= 0) finish('Checkout error', 'No valid items were found.');
+
+/* Persist order before calling the independent payment service. */
+$pdo->beginTransaction();
+try {
+    $stmt = $pdo->prepare("INSERT INTO orders (customer_name,total_amount,status) VALUES (?,?,'PENDING_PAYMENT')");
+    $stmt->execute([$customer, number_format($total,2,'.','')]);
+    $orderId = (int)$pdo->lastInsertId();
+    $itemStmt = $pdo->prepare('INSERT INTO order_items (order_id,product_id,product_name,quantity,unit_price) VALUES (?,?,?,?,?)');
+    foreach ($validItems as $i) {
+        $itemStmt->execute([$orderId,$i['product']['id'],$i['product']['name'],$i['qty'],$i['product']['price']]);
+    }
+    $pdo->commit();
+} catch (Throwable $e) {
+    if ($pdo->inTransaction()) $pdo->rollBack();
+    finish('Order error', 'Could not save the order.');
+}
+
+/* =====================================================================
+ *  START OF DESIGNATED INTEGRATION SECTION  (Steps 8 to 14)
+ * ===================================================================== */
+
+/* ---------- STEP 8: Construct the payment request ---------- */
+
+$apiUrl = 'http://localhost/payment-gateway/api/payments.php';
+
+// Simulator control (teaching only). Change to 'FAILED' for Step 16,
+// 'PENDING' for Step 17, then set back to 'SUCCESS'.
+$simulatedOutcome = 'SUCCESS';
+
+$payload = [
+    'order_id'        => $orderId,                   // from the saved order
+    'amount'          => round($total, 2),           // from the computed total
+    'customer_name'   => $customer,
+    'payment_method'  => $method,
+    'idempotency_key' => 'cart-order-' . $orderId,   // same order => same key
+    'outcome'         => $simulatedOutcome,
+];
+$jsonPayload = json_encode($payload);
+$headers = [
+    'Content-Type: application/json',
+    'Accept: application/json',
+];
+
+/* ---------- STEP 9: Send the request with cURL ---------- */
+
+$ch = curl_init($apiUrl);
+curl_setopt_array($ch, [
+    CURLOPT_POST           => true,
+    CURLOPT_POSTFIELDS     => $jsonPayload,
+    CURLOPT_HTTPHEADER     => $headers,
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_CONNECTTIMEOUT => 3,
+    CURLOPT_TIMEOUT        => 8,
+]);
+$raw      = curl_exec($ch);
+$curlErr  = curl_errno($ch);
+$httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+curl_close($ch);
+
+/* ---------- STEP 13 helper: update the order (cart DB only) ---------- */
+
+function update_order(PDO $pdo, int $orderId, string $status, ?string $txnId): void {
+    $stmt = $pdo->prepare('UPDATE orders SET status = ?, gateway_transaction_id = ? WHERE id = ?');
+    $stmt->execute([$status, $txnId, $orderId]);
+}
+
+/* ---------- STEP 10 + 12: Decode, validate, handle errors ---------- */
+
+// Timeout or gateway unavailable: the outcome is UNCERTAIN.
+if ($raw === false || $curlErr !== 0) {
+    update_order($pdo, $orderId, 'PAYMENT_PENDING', null);
+    unset($_SESSION['cart']);
+    finish('Payment status unknown',
+        "Order #$orderId was saved, but the payment service did not respond. Do not pay again; verify first.");
+}
+
+$res = json_decode((string)$raw, true);
+
+// HTTP 4xx: the gateway rejected the request, so no transaction exists.
+if ($httpCode >= 400 && $httpCode < 500) {
+    update_order($pdo, $orderId, 'INTEGRATION_ERROR', null);
+    finish('Payment request rejected', "Order #$orderId could not be sent for payment.");
+}
+
+// HTTP 5xx or invalid JSON: outcome unknown.
+if ($httpCode !== 200 || !is_array($res)) {
+    update_order($pdo, $orderId, 'PAYMENT_PENDING', null);
+    unset($_SESSION['cart']);
+    finish('Payment status unknown',
+        "Order #$orderId was saved, but the response was invalid. Verify before retrying.");
+}
+
+// Required fields, known status, and the response must match THIS order.
+$txnId    = $res['transaction_id'] ?? null;
+$status   = $res['status'] ?? null;
+$validTxn = is_string($txnId) && $txnId !== '' && strlen($txnId) <= 80;
+
+$validAll = ($res['success'] ?? false) === true
+    && $validTxn
+    && is_string($status) && in_array($status, ['SUCCESS','FAILED','PENDING'], true)
+    && isset($res['order_id']) && (int)$res['order_id'] === $orderId
+    && isset($res['amount']) && abs((float)$res['amount'] - round($total, 2)) < 0.01;
+
+if (!$validAll) {
+    update_order($pdo, $orderId, 'PAYMENT_PENDING', $validTxn ? $txnId : null);
+    unset($_SESSION['cart']);
+    finish('Payment status unknown',
+        "Order #$orderId was saved, but the gateway response did not match the order. Verify before retrying.");
+}
+
+/* ---------- STEP 11 + 13: Map outcome, save status and transaction ID ---------- */
+
+$statusMap = [
+    'SUCCESS' => 'PAID',
+    'FAILED'  => 'PAYMENT_FAILED',
+    'PENDING' => 'PAYMENT_PENDING',
+];
+update_order($pdo, $orderId, $statusMap[$status], $txnId);
+
+/* ---------- STEP 14: Display the result ---------- */
+
+if ($status === 'SUCCESS') {
+    unset($_SESSION['cart']);
+    finish('Payment successful', "Order #$orderId is PAID. Transaction: $txnId.");
+}
+if ($status === 'PENDING') {
+    unset($_SESSION['cart']);
+    finish('Payment pending', "Order #$orderId is awaiting confirmation. Transaction: $txnId.");
+}
+finish('Payment failed', "Order #$orderId was not paid. Transaction: $txnId. Your cart is kept so you can try again.");
+
+/* ===================================================================== 
+ *  END OF DESIGNATED INTEGRATION SECTION
+ * ===================================================================== */
